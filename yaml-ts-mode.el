@@ -35,6 +35,7 @@
 ;;; Code:
 
 (require 'elec-pair)
+(require 'newcomment)
 (require 'treesit)
 
 (defgroup yaml-ts nil
@@ -162,11 +163,26 @@
   (setq-local syntax-propertize-function
               #'yaml-ts-mode-syntax--propertize)
   (add-hook 'syntax-propertize-extend-region-functions
-            #'syntax-propertize-wholelines nil t)
+            #'syntax-propertize-wholelines nil t))
+
+;;;; Comment Commands
+
+(defun yaml-ts-mode-comment--uncomment-region (beg end &optional arg)
+  "Uncomment BEG through END using syntax classified before editing.
+Pass ARG to `uncomment-region-default'."
+  (syntax-propertize end)
+  (unwind-protect
+      (let ((syntax-propertize-function nil))
+        (uncomment-region-default beg end arg))
+    (syntax-ppss-flush-cache beg)))
+
+(defun yaml-ts-mode-comment--setup ()
+  "Configure comment commands for the current buffer."
   (setq-local comment-start "# ")
   (setq-local comment-end "")
   (setq-local comment-start-skip "#[ \t]*")
-  (setq-local comment-use-syntax t))
+  (setq-local comment-use-syntax t)
+  (setq-local uncomment-region-function #'yaml-ts-mode-comment--uncomment-region))
 
 ;;;; Electric Pair
 
@@ -188,7 +204,8 @@
 
 (defun yaml-ts-mode-electric-pair--setup ()
   "Configure electric pairing for the current buffer."
-  (let ((pairs '((?\[ . ?\]) (?{ . ?})))
+  (let ((pairs '((?\[ . ?\]) (?{ . ?})
+                 (?\" . ?\") (?\' . ?\')))
         (table (copy-syntax-table (syntax-table))))
     (setq-local electric-pair-pairs (append electric-pair-pairs pairs))
     (dolist (pair pairs)
@@ -377,7 +394,9 @@
        (not (treesit-parent-until
              node
              (rx string-start
-                 (or "line_break" "separation" "line_prefix" "comment")
+                 (or "line_break" "separation" "line_prefix" "comment"
+                     "scalar_line_break" "scalar_line_prefix"
+                     "scalar_line_suffix" "block_header_break")
                  string-end)
              t))))
 
@@ -420,11 +439,20 @@ CLOSING non-nil means that the line starts with the closing delimiter."
                          token)
                        yaml-ts-mode--flow-regexp)))
            (properties (and token (treesit-parent-until
-                                   token "^node_with_properties$"))))
+                                   token "^node_with_properties$")))
+           (header (and token (treesit-parent-until
+                               token "^block_scalar_header$" t))))
       (cond
        ((null token)
         (cons (save-excursion (goto-char bol) (line-beginning-position)) 0))
        (flow (yaml-ts-mode-indent--flow flow nil))
+       ((and header (treesit-node-child-by-field-name header "indentation"))
+        (let ((owner (treesit-parent-until header yaml-ts-mode--owner-regexp))
+              (width (treesit-node-child-by-field-name header "indentation")))
+          (cons (if (equal (treesit-node-type owner) "document")
+                    (save-excursion (goto-char bol) (line-beginning-position))
+                  (treesit-node-start owner))
+                (string-to-number (treesit-node-text width t)))))
        ((or (and (member (treesit-node-type token)
                          '("value_indicator" "sequence_indicator"))
                  (not (treesit-node-child-by-field-name parent "value")))
@@ -432,7 +460,7 @@ CLOSING non-nil means that the line starts with the closing delimiter."
                  (not (treesit-node-child-by-field-name parent "key")))
             (and properties
                  (not (treesit-node-child-by-field-name properties "content")))
-            (treesit-parent-until token "^block_scalar_header$" t))
+            header)
         (yaml-ts-mode-indent--content
          (treesit-parent-until token yaml-ts-mode--owner-regexp) nil bol))
        (t (cons (yaml-ts-mode-indent--line-start (treesit-node-start token)) 0))))))
@@ -453,7 +481,8 @@ CLOSING non-nil means that the line starts with the closing delimiter."
   "Return the indentation of BOL at NODE in PARENT within a scalar."
   (let ((scalar (treesit-parent-until
                  (or node parent) yaml-ts-mode--scalar-regexp t)))
-    (when (and scalar (< (treesit-node-start scalar) bol))
+    (when (and scalar (< (treesit-node-start scalar) bol)
+               (not (save-excursion (goto-char bol) (and (bolp) (eolp)))))
       (let* ((anchor (yaml-ts-mode-indent--line-start (treesit-node-start scalar)))
              (offset (- (yaml-ts-mode-indent--column bol)
                         (yaml-ts-mode-indent--column anchor))))
@@ -508,6 +537,7 @@ CLOSING non-nil means that the line starts with the closing delimiter."
   (yaml-ts-mode--ensure-grammar 'yaml)
   (setq-local treesit-primary-parser (treesit-parser-create 'yaml))
   (yaml-ts-mode-syntax--setup)
+  (yaml-ts-mode-comment--setup)
   (yaml-ts-mode-electric-pair--setup)
   (yaml-ts-mode-font-lock--setup)
   (yaml-ts-mode-navigation--setup)
