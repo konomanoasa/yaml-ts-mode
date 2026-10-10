@@ -46,7 +46,7 @@
 
 (defconst yaml-ts-mode--grammar-sources
   '((yaml "https://github.com/konomanoasa/tree-sitter-yaml"
-          :revision "v0.2.0"))
+          :revision "v0.3.0"))
   "Tree-sitter grammar sources for YAML 1.2.2.")
 
 (defun yaml-ts-mode--ensure-grammar (language)
@@ -448,11 +448,13 @@ CLOSING non-nil means that the line starts with the closing delimiter."
        (flow (yaml-ts-mode-indent--flow flow nil))
        ((and header (treesit-node-child-by-field-name header "indentation"))
         (let ((owner (treesit-parent-until header yaml-ts-mode--owner-regexp))
-              (width (treesit-node-child-by-field-name header "indentation")))
-          (cons (if (equal (treesit-node-type owner) "document")
-                    (save-excursion (goto-char bol) (line-beginning-position))
-                  (treesit-node-start owner))
-                (string-to-number (treesit-node-text width t)))))
+              (width (string-to-number
+                      (treesit-node-text
+                       (treesit-node-child-by-field-name header "indentation") t))))
+          (if (equal (treesit-node-type owner) "document")
+              (cons (save-excursion (goto-char bol) (line-beginning-position))
+                    (1- width))
+            (cons (treesit-node-start owner) width))))
        ((or (and (member (treesit-node-type token)
                          '("value_indicator" "sequence_indicator"))
                  (not (treesit-node-child-by-field-name parent "value")))

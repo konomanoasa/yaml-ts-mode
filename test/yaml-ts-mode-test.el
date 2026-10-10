@@ -453,6 +453,32 @@
       (ert-info ((format "%S at %d" fragment offset))
         (should (eq (yaml-ts-mode-test--face fragment offset) face))))))
 
+(ert-deftest yaml-ts-mode-fontifies-leaves-within-syntax-issues ()
+  (pcase-dolist (`(,source ,expected)
+                 '(("key: |22++x\n  text\n"
+                    (("22" font-lock-number-face)
+                     ("++" font-lock-punctuation-face)
+                     ("x" nil)
+                     ("text" font-lock-string-face)))
+                   ("%YAML 1."
+                    (("YAML" font-lock-preprocessor-face)
+                     ("1." font-lock-number-face)))
+                   ("key: \"text\\u12"
+                    (("text" font-lock-string-face) ("\\u12" nil)))
+                   ("key: !<tag:x%2"
+                    (("tag:x" font-lock-type-face) ("%2" nil)))
+                   ("&first &second"
+                    (("first" font-lock-constant-face)
+                     ("second" font-lock-constant-face)))))
+    (ert-info ((format "%S" source))
+      (with-temp-buffer
+        (insert source)
+        (let ((treesit-font-lock-level 4)) (yaml-ts-mode))
+        (font-lock-ensure)
+        (pcase-dolist (`(,fragment ,face) expected)
+          (dotimes (offset (length fragment))
+            (should (eq (yaml-ts-mode-test--face fragment offset) face))))))))
+
 ;;;; Navigation
 
 (ert-deftest yaml-ts-mode-navigates-nested-sexp-boundaries ()
@@ -495,7 +521,7 @@
       (should (equal (nreverse items)
                      '("first:\n  nested: value\n" "second: [one, two]"
                        "alpha" "{b: c}" "d: e" "f: g" "h: i"
-                       "- one" "- two" "!tag scalar" "*alias" "&empty\n"))))
+                       "- one" "- two" "!tag scalar" "*alias" "&empty"))))
     (goto-char (yaml-ts-mode-test--position "nested"))
     (beginning-of-defun)
     (should (= (point) (yaml-ts-mode-test--position "first:")))
@@ -506,6 +532,23 @@
     (goto-char (yaml-ts-mode-test--position "b: c"))
     (beginning-of-defun)
     (should (= (point) (yaml-ts-mode-test--position "{b: c}")))))
+
+(ert-deftest yaml-ts-mode-navigates-property-only-nodes-without-trailing-layout ()
+  (dolist (source '("&empty  # tail\n\n" "!tag  # tail\n\n"
+                    "&first &second  # tail\n\n"))
+    (ert-info ((format "%S" source))
+      (with-temp-buffer
+        (insert source)
+        (yaml-ts-mode)
+        (goto-char (point-min))
+        (forward-sexp)
+        (should (= (point) (yaml-ts-mode-test--position "  # tail")))
+        (backward-sexp)
+        (should (= (point) (point-min)))
+        (end-of-defun)
+        (should (= (point) (1+ (yaml-ts-mode-test--position "\n"))))
+        (beginning-of-defun)
+        (should (= (point) (point-min)))))))
 
 (ert-deftest yaml-ts-mode-navigates-flow-collections-and-outermost-items ()
   (with-temp-buffer
@@ -622,7 +665,9 @@
                    ("root:\n  text: >4-" "\n      value\nnext: value\n" 6)
                    ("- text: |-4" "\n      value\n" 6)
                    ("- |1" "\n value\n" 1)
-                   ("|4" "\n    value\n" 4)
+                   ("|1" "\nvalue\n" 0)
+                   ("|4" "\n   value\n" 3)
+                   ("--- >4-" "\n   value\n" 3)
                    ("text: |\n  value" "" 2)))
     (ert-info ((format "%S / %S" prefix suffix))
       (with-temp-buffer
@@ -635,7 +680,12 @@
           (should (= (current-column) column)))
         (should (equal (buffer-substring-no-properties (point-min) (point-max))
                        (concat prefix "\n\n\n" (make-string column ?\s) suffix)))
-        (insert "added")
+        (let ((start (point)))
+          (insert "added")
+          (when (member prefix '("|1" "|4" "--- >4-"))
+            (let ((text (treesit-node-at start)))
+              (should (equal (treesit-node-type text) "scalar_text"))
+              (should (equal (treesit-node-text text t) "added")))))
         (should-not (treesit-search-subtree (treesit-buffer-root-node)
                                             "^syntax_issue$"))))))
 
