@@ -35,6 +35,22 @@
 
 ;;;; Helpers
 
+(defmacro yaml-ts-mode-test--with-file (file properties source &rest body)
+  "Evaluate BODY with SOURCE in FILE using EditorConfig PROPERTIES."
+  (declare (indent 3) (debug (form form form body)))
+  `(let ((default-directory
+          (file-name-as-directory (make-temp-file "yaml-ts-mode-" t))))
+     (unwind-protect
+         (progn
+           (with-temp-file (expand-file-name ".editorconfig")
+             (insert "root = true\n[*]\n" ,properties))
+           (with-temp-buffer
+             (setq buffer-file-name (expand-file-name ,file))
+             (insert ,source)
+             (yaml-ts-mode)
+             ,@body))
+       (delete-directory default-directory t))))
+
 (defun yaml-ts-mode-test--position (fragment &optional line)
   (save-excursion
     (goto-char (point-min))
@@ -90,15 +106,22 @@
         (push (list (get-text-property position 'face) (syntax-after position)) state)))
     (nreverse state)))
 
-(defun yaml-ts-mode-test--should-match-fresh-buffer (level)
+(defun yaml-ts-mode-test--should-match-fresh-buffer (&optional level compare-tree)
+  "Compare classifications at LEVEL and optionally COMPARE-TREE with fresh parsing."
   (let ((source (buffer-substring-no-properties (point-min) (point-max)))
         (state (yaml-ts-mode-test--buffer-state))
-        (file buffer-file-name))
+        (tree (when compare-tree
+                (treesit-node-string (treesit-parser-root-node treesit-primary-parser))))
+        (file buffer-file-name)
+        (level (or level treesit-font-lock-level)))
     (with-temp-buffer
       (setq buffer-file-name file)
       (insert source)
       (let ((treesit-font-lock-level level)) (yaml-ts-mode))
-      (should (equal state (yaml-ts-mode-test--buffer-state))))))
+      (should (equal state (yaml-ts-mode-test--buffer-state)))
+      (when compare-tree
+        (should (equal tree (treesit-node-string
+                             (treesit-parser-root-node treesit-primary-parser))))))))
 
 ;;;; Grammar
 
@@ -715,6 +738,52 @@
 
 ;;;; Updates
 
+(ert-deftest yaml-ts-mode-refreshes-edited-owners-without-parser-notifications ()
+  (pcase-dolist (`(,language ,file ,properties ,source ,fragment ,owner-start)
+                 '((yaml "test.yaml" "" "item:\n  value: text\n" "text" 1)))
+    (dolist (narrow '(nil t))
+      (ert-info ((format "%s, narrowed: %s" language narrow))
+        (let ((treesit-font-lock-level 4))
+          (yaml-ts-mode-test--with-file file properties source
+                                        (rename-buffer "yaml-ts-mode-test" t)
+                                        (let ((noninteractive nil)) (font-lock-mode 1))
+                                        (yaml-ts-mode-test--buffer-state)
+                                        (should (get-text-property owner-start 'fontified))
+                                        (let ((parser treesit-primary-parser))
+                                          (should-not (treesit-node-check (treesit-parser-root-node parser) 'has-error))
+                                          (dolist (notifier (treesit-parser-notifiers parser))
+                                            (treesit-parser-remove-notifier parser notifier))
+                                          (goto-char (yaml-ts-mode-test--position fragment))
+                                          (when narrow
+                                            (narrow-to-region (line-beginning-position) (line-end-position)))
+                                          (insert "x")
+                                          (widen)
+                                          (should (eq parser treesit-primary-parser))
+                                          (should-not (get-text-property owner-start 'fontified))
+                                          (yaml-ts-mode-test--should-match-fresh-buffer 4 t))))))))
+
+(ert-deftest yaml-ts-mode-reparses-a-bom-moved-to-buffer-start ()
+  (pcase-dolist (`(,language ,file ,properties ,prefix ,body ,fragment ,face)
+                 '((yaml "test.yaml" "" "key: value\n" "# note\n" "note" font-lock-comment-face)))
+    (dolist (narrow '(nil t))
+      (ert-info ((format "%s, narrowed: %s" language narrow))
+        (let ((treesit-font-lock-level 4))
+          (yaml-ts-mode-test--with-file file properties (concat prefix "\ufeff" body)
+                                        (yaml-ts-mode-test--buffer-state)
+                                        (when narrow (narrow-to-region 1 (+ 2 (length prefix))))
+                                        (delete-region 1 (1+ (length prefix)))
+                                        (widen)
+                                        (should (eq (treesit-parser-language treesit-primary-parser) language))
+                                        (should (equal (treesit-parser-list) (list treesit-primary-parser)))
+                                        (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                                                       (concat "\ufeff" body)))
+                                        (yaml-ts-mode-test--buffer-state)
+                                        (should-not (get-text-property 1 'face))
+                                        (goto-char (point-min))
+                                        (search-forward fragment)
+                                        (should (eq (get-text-property (1- (point)) 'face) face))
+                                        (yaml-ts-mode-test--should-match-fresh-buffer 4 t)))))))
+
 (ert-deftest yaml-ts-mode-refreshes-string-syntax-after-issue-repair ()
   (with-temp-buffer
     (insert "key: \"first\n  second\\q\"\ntail: plain`text\n")
@@ -734,6 +803,35 @@
     (should (= (yaml-ts-mode-test--syntax-class "\"first") 1))
     (should (= (yaml-ts-mode-test--syntax-class "\"\ntail") 1))
     (yaml-ts-mode-test--should-match-fresh-buffer 3)))
+
+(ert-deftest yaml-ts-mode-preserves-items-around-unexpected-collection-content ()
+  (pcase-dolist (`(,source ,items)
+                 '(("first: \"a\" stray\n# note\nlast: &keep ok\n"
+                    ("first: \"a\"" "last: &keep ok"))
+                   ("- \"a\" stray\n# note\n- &keep ok\n"
+                    ("- \"a\"" "- &keep ok"))))
+    (with-temp-buffer
+      (insert source)
+      (let ((treesit-font-lock-level 4)) (yaml-ts-mode))
+      (font-lock-ensure)
+      (should (eq (yaml-ts-mode-test--face "stray") 'font-lock-string-face))
+      (should (eq (yaml-ts-mode-test--face "note") 'font-lock-comment-face))
+      (should (eq (yaml-ts-mode-test--face "keep") 'font-lock-constant-face))
+      (should (= (yaml-ts-mode-test--syntax-class "\"a") 15))
+      (let (actual)
+        (dolist (capture (treesit-query-capture (treesit-buffer-root-node) '((_) @node)))
+          (when (treesit-node-match-p (cdr capture) 'defun)
+            (push (treesit-node-text (cdr capture) t) actual)))
+        (should (equal (nreverse actual) items)))
+      (should (equal (mapcar #'car (cdr (assoc "Anchor" (funcall imenu-create-index-function))))
+                     '("keep")))
+      (should (equal (yaml-ts-mode-test--indent source) source))
+      (goto-char (yaml-ts-mode-test--position "stray"))
+      (delete-char 5)
+      (yaml-ts-mode-test--should-match-fresh-buffer 4)
+      (should-not (treesit-search-subtree (treesit-buffer-root-node) "^syntax_issue$"))
+      (insert "stray")
+      (yaml-ts-mode-test--should-match-fresh-buffer 4))))
 
 (ert-deftest yaml-ts-mode-updates-like-fresh-buffer ()
   (pcase-dolist (`(,source ,old ,new ,fragment ,face)
